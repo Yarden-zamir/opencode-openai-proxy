@@ -10,9 +10,17 @@ opencode's session API, so any client that speaks "OpenAI-compatible backend"
 client -> POST /v1/chat/completions -> proxy -> opencode /session + /session/{id}/message
 ```
 
-Each request is stateless: the proxy creates a fresh opencode session, sends the
-last user message as the prompt, and returns the assistant's text as
-`choices[0].message.content`.
+Conversations stay continuous with no local state: the proxy hashes the first
+user message of each request into an opencode session title
+(`openai-proxy:{hash}`), looks that title up via `GET /session`, and reuses the
+session if it exists (otherwise creates it). opencode persists the history, so
+only the last user message is forwarded to the reused session. The assistant's
+text is returned as `choices[0].message.content`.
+
+Because OpenAI clients resend the whole message array every turn, the first
+message — and thus the hash — is stable for the life of a chat; starting a fresh
+chat on the client maps to a new session. Two conversations that open with
+identical text share a session by design (see [issues](https://github.com/Yarden-zamir/opencode-openai-proxy/issues)).
 
 ## Deployment
 

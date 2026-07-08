@@ -7,9 +7,18 @@ each request into the opencode HTTP API:
     POST /session/{id}/message         -> send the prompt, get assistant parts back
 
 The last user message is sent as the prompt; the assistant's text parts are
-returned as choices[0].message.content. This is intentionally stateless: every
-request creates a fresh opencode session so the caller (e.g. an Android
-assistant using an OpenAI backend) needs no session bookkeeping.
+returned as choices[0].message.content.
+
+Conversations are kept continuous without any local state map: the first user
+message of a request is hashed into an opencode session title
+("openai-proxy:{hash}"). On each request the proxy looks up that title via
+GET /session and reuses the session if it exists, otherwise creates it. Since
+opencode persists its own sessions, the history lives there. OpenAI clients
+resend the full message array every turn, so the first message (hence the
+hash) is stable across a conversation; only the last user message is sent to
+the reused session. Starting a fresh chat on the client (new first message)
+naturally maps to a new session. Collisions between conversations that open
+with identical text are accepted by design.
 
 Config via environment:
     OPENCODE_API_URL          base URL of opencode serve   (default http://opencode:4096)
@@ -23,6 +32,7 @@ Config via environment:
 """
 
 import base64
+import hashlib
 import json
 import os
 import sys
@@ -43,6 +53,10 @@ PROXY_PORT = int(os.environ.get("PROXY_PORT", "8080"))
 
 # Aliases the caller may send as "model" that mean "use the configured default".
 DEFAULT_MODEL_ALIASES = {"", "opencode", "default", "gpt-4o-mini"}
+
+# Prefix for opencode session titles this proxy owns; the rest is a hash of the
+# conversation's first user message.
+SESSION_TITLE_PREFIX = "openai-proxy:"
 
 
 def opencode_auth_header():
@@ -80,23 +94,67 @@ def resolve_model(requested):
     return {"providerID": DEFAULT_PROVIDER, "modelID": name}
 
 
+def message_text(message):
+    """Text of one OpenAI message; joins the text parts of multimodal content."""
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    # OpenAI multimodal content: list of {type, text} parts.
+    if isinstance(content, list):
+        texts = [
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        return "\n".join(t for t in texts if t)
+    return ""
+
+
 def last_user_prompt(messages):
     """Extract the last user message's text from an OpenAI messages array."""
     for message in reversed(messages or []):
-        if message.get("role") != "user":
-            continue
-        content = message.get("content", "")
-        if isinstance(content, str):
-            return content
-        # OpenAI multimodal content: list of {type, text} parts.
-        if isinstance(content, list):
-            texts = [
-                part.get("text", "")
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            ]
-            return "\n".join(t for t in texts if t)
+        if message.get("role") == "user":
+            return message_text(message)
     return ""
+
+
+def conversation_key(messages):
+    """Stable key for a conversation: hash of its first user message.
+
+    OpenAI clients resend the whole history each turn, so the first user
+    message is constant for the life of a chat and distinct per new chat.
+    """
+    for message in messages or []:
+        if message.get("role") == "user":
+            text = message_text(message)
+            if not text:
+                return None
+            return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+    return None
+
+
+def find_session(key):
+    """Return the existing opencode session (dict) for this conversation, or None."""
+    if not key:
+        return None
+    title = SESSION_TITLE_PREFIX + key
+    path = "/session"
+    if OPENCODE_DIRECTORY:
+        path += "?" + urllib.parse.urlencode({"directory": OPENCODE_DIRECTORY})
+    sessions = opencode_request("GET", path)
+    if not isinstance(sessions, list):
+        return None
+    matches = [
+        s
+        for s in sessions
+        if isinstance(s, dict) and s.get("title") == title and s.get("id")
+    ]
+    if not matches:
+        return None
+    # Deterministic if duplicates ever exist (e.g. racing first turns): the
+    # oldest by creation time, which holds the full history.
+    matches.sort(key=lambda s: s.get("time", {}).get("created", 0))
+    return matches[0]
 
 
 def collect_response_text(parts):
@@ -108,14 +166,16 @@ def collect_response_text(parts):
     return "".join(texts)
 
 
-def run_completion(prompt, model):
-    """Create a session, send the prompt, return the assistant text."""
-    create_body = {"title": "openai-proxy"}
-    if OPENCODE_DIRECTORY:
-        create_body["directory"] = OPENCODE_DIRECTORY
-    session = opencode_request("POST", "/session", create_body)
-    if not session or "id" not in session:
-        raise RuntimeError("opencode did not return a session id")
+def run_completion(key, prompt, model):
+    """Reuse (or create) the conversation's opencode session, send the prompt."""
+    session = find_session(key)
+    if session is None:
+        create_body = {"title": SESSION_TITLE_PREFIX + key if key else "openai-proxy"}
+        if OPENCODE_DIRECTORY:
+            create_body["directory"] = OPENCODE_DIRECTORY
+        session = opencode_request("POST", "/session", create_body)
+        if not session or "id" not in session:
+            raise RuntimeError("opencode did not return a session id")
     session_id = session["id"]
 
     message_body = {
@@ -182,14 +242,16 @@ class Handler(BaseHTTPRequestHandler):
             self.write_json(400, {"error": {"message": "invalid JSON body"}})
             return
 
-        prompt = last_user_prompt(request.get("messages"))
+        messages = request.get("messages")
+        prompt = last_user_prompt(messages)
         if not prompt:
             self.write_json(400, {"error": {"message": "no user message content found"}})
             return
+        key = conversation_key(messages)
         model = resolve_model(request.get("model"))
 
         try:
-            content = run_completion(prompt, model)
+            content = run_completion(key, prompt, model)
         except urllib.error.HTTPError as error:
             detail = error.read().decode(errors="replace")
             self.write_json(
