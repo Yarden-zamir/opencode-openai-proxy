@@ -82,16 +82,54 @@ def opencode_request(method, path, body=None):
     return json.loads(payload)
 
 
+_MODEL_INDEX = None  # cached {providerID: {modelID, ...}} from opencode
+
+
+def available_models():
+    """Lazily fetch and cache opencode's provider->models catalog.
+
+    Cached for the process lifetime (the proxy restarts on every deploy). On any
+    fetch failure returns an empty index, which makes resolve_model fall back to
+    the configured default rather than forwarding an unservable model.
+    """
+    global _MODEL_INDEX
+    if _MODEL_INDEX is None:
+        index = {}
+        try:
+            data = opencode_request("GET", "/config/providers")
+        except Exception:  # noqa: BLE001 - degrade to "default only", never crash
+            data = None
+        for provider in (data or {}).get("providers", []):
+            pid = provider.get("id")
+            if pid:
+                index[pid] = set((provider.get("models") or {}).keys())
+        _MODEL_INDEX = index
+    return _MODEL_INDEX
+
+
 def resolve_model(requested):
-    """Map an OpenAI-style model string to opencode {providerID, modelID}."""
+    """Map an OpenAI-style model string to a {providerID, modelID} opencode serves.
+
+    Unknown models (e.g. an OpenAI name the app sends that this opencode instance
+    has no provider for) fall back to the configured default instead of erroring.
+    """
     name = (requested or "").strip()
+    default = {"providerID": DEFAULT_PROVIDER, "modelID": DEFAULT_MODEL}
     if name in DEFAULT_MODEL_ALIASES:
-        return {"providerID": DEFAULT_PROVIDER, "modelID": DEFAULT_MODEL}
+        return default
+    index = available_models()
+    # Model ids can themselves contain "/" (e.g. requesty's "xai/grok-4"), so try
+    # the whole string as a model id before reading "provider/model".
+    if name in index.get(DEFAULT_PROVIDER, ()):
+        return {"providerID": DEFAULT_PROVIDER, "modelID": name}
     if "/" in name:
         provider, model = name.split("/", 1)
-        return {"providerID": provider, "modelID": model}
-    # Bare model id with no provider: keep the configured provider.
-    return {"providerID": DEFAULT_PROVIDER, "modelID": name}
+        if model in index.get(provider, ()):
+            return {"providerID": provider, "modelID": model}
+    for pid, models in index.items():
+        if name in models:
+            return {"providerID": pid, "modelID": name}
+    return default
 
 
 def message_text(message):
@@ -250,20 +288,24 @@ class Handler(BaseHTTPRequestHandler):
         key = conversation_key(messages)
         model = resolve_model(request.get("model"))
 
+        model_name = f"{model['providerID']}/{model['modelID']}"
         try:
             content = run_completion(key, prompt, model)
         except urllib.error.HTTPError as error:
             detail = error.read().decode(errors="replace")
+            sys.stderr.write(f"opencode error {error.code} for {model_name}: {detail}\n")
+            sys.stderr.flush()
             self.write_json(
                 502,
                 {"error": {"message": f"opencode error {error.code}: {detail}"}},
             )
             return
         except Exception as error:  # noqa: BLE001 - surface any failure to the caller
+            sys.stderr.write(f"proxy error for {model_name}: {error}\n")
+            sys.stderr.flush()
             self.write_json(502, {"error": {"message": f"proxy error: {error}"}})
             return
 
-        model_name = f"{model['providerID']}/{model['modelID']}"
         self.write_json(
             200,
             {
