@@ -1,5 +1,7 @@
 # opencode-openai-proxy
 
+[![kitshn](https://kitshn.yarden-zamir.com/b/Yarden-zamir/opencode-openai-proxy.svg)](https://opencode-openai.yarden-zamir.com)
+
 An OpenAI-compatible bridge in front of an existing [`opencode serve`](https://github.com/Yarden-zamir/opencode-serve) instance.
 
 It exposes the OpenAI chat-completions API and translates each request into
