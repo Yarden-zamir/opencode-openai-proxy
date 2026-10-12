@@ -1,6 +1,8 @@
 # opencode-openai-proxy
 
-[![kitshn](https://kitshn.yarden-zamir.com/b/Yarden-zamir/opencode-openai-proxy.svg)](https://opencode-openai.yarden-zamir.com)
+> **Sunset on 2026-10-12.** This service no longer runs. The KitSHn deployment, its route
+> `opencode-openai.yarden-zamir.com`, its deploy workflow, and its deploy secrets are removed.
+> The Deployment section below describes how it ran before.
 
 An OpenAI-compatible bridge in front of an existing [`opencode serve`](https://github.com/Yarden-zamir/opencode-serve) instance.
 

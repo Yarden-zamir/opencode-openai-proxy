@@ -1,4 +1,0 @@
-deploy:
-  - on: push
-    branch: main
-    name: prod
